@@ -1,0 +1,1020 @@
+var CCHPayloadPrepScriptInclude = Class.create();
+CCHPayloadPrepScriptInclude.prototype = {
+    initialize: function() {},
+
+    /**
+     * Main entry point for payload preparation.
+     * @param {invoiceSysID: string, doc_type: string} inputs
+     * @returns {payload: string, payload_footer: string, filebody1: string, filebody2: string, filebody3: string, file_format_error: string}
+     */
+    preparePayload: function(inputs) {
+        inputs = inputs || {};
+        var outputs = {};
+    // ... code ...
+
+    var invoiceSysId = inputs.invoiceSysID;
+    var sa = new GlideSysAttachment();
+    var fileName = '';
+
+    // async - sync switcher
+    var asyncSwitchedOn = gs.getProperty('x_742494_cch_edge.CCH_APO_PD_Async_enabler');
+
+    // Diffrentent file format check
+    (function enforceAllowedAttachmentTypes(invoiceSysId) {
+        var ALLOWED_MIME = {
+            'application/pdf': true,
+            'image/tiff': true,
+            'application/octet-stream': true
+        };
+        var ALLOWED_EXT = /\.(pdf|tif|tiff)$/i;
+
+        var badFiles = [];
+
+        var attCheck = new GlideRecord('sys_attachment');
+        attCheck.addQuery('table_name', 'sn_shop_invoice');
+        attCheck.addQuery('table_sys_id', invoiceSysId);
+        attCheck.addQuery('file_name', 'CONTAINS', '.pdf').addOrCondition('file_name', 'CONTAINS', '.PDF');
+        attCheck.query();
+
+        while (attCheck.next()) {
+            var name = (attCheck.file_name + '').trim();
+            var ct = (attCheck.content_type + '').toLowerCase();
+
+            var okByMime = !!ALLOWED_MIME[ct];
+            var okByExt = ALLOWED_EXT.test(name);
+
+            if (!okByMime && !okByExt) {
+                badFiles.push(name + ' [' + ct + ']');
+            }
+        }
+
+        if (badFiles.length > 0) {
+            var msg = 'Incorrect file format of the attachment.';
+            outputs.file_format_error = msg; // <-- populate output
+
+            // log for troubleshooting
+            gs.warn('PayloadPrep: ' + msg + ' (invoice=' + invoiceSysId + ')');
+
+        }
+    })(invoiceSysId);
+
+    var attachment = new GlideRecord('sys_attachment');
+    attachment.addQuery('table_sys_id', invoiceSysId);
+    attachment.addQuery('file_name', 'CONTAINS', '.pdf').addOrCondition('file_name', 'CONTAINS', '.PDF');
+    attachment.query();
+    if (attachment.next()) {
+        fileName = String(attachment.file_name);
+        fileName = fileName.replace(/&/g, ' ');
+    } else {
+        throw 'Attachment not found for invoice sys_id: ' + invoiceSysId;
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /////////////////////////////////////////////[ Enhanced logic for dealing with different size attachments ]////////////////////////////////////////
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    var chunkThreshold = 8000;
+    var chunkThresholdDouble = 16000;
+    var fileSizeThreshold = 5000000;
+    var binData;
+
+    if (attachment.getValue('size_bytes') > fileSizeThreshold) {
+        // big size file
+        var gsa = GlideSysAttachmentInputStream(attachment.sys_id + '');
+        var baos = new Packages.java.io.ByteArrayOutputStream();
+        gsa.writeTo(baos);
+        baos.close();
+        binData = baos.toByteArray();
+    } else {
+        // small size file
+        binData = sa.getBytes(attachment);
+    }
+
+    // ---- Split byte[] into 1024-byte chunks ----
+    function splitIntoByteChunks(bytes, chunkSize) {
+        var total = bytes.length;
+
+        var JArray = Packages.java.lang.reflect.Array;
+        var JByte = Packages.java.lang.Byte.TYPE;
+
+        var chunks = [];
+
+        for (var i = 0; i < total; i += chunkSize) {
+            var end = Math.min(i + chunkSize, total);
+            var len = end - i;
+
+            var out = JArray.newInstance(JByte, len);
+
+            for (var j = 0; j < len; j++) {
+                out[j] = bytes[i + j];
+            }
+
+            chunks.push(out);
+        }
+
+        // === NEW SPLITTING LOGIC ===
+        var chunksPart1 = [];
+        var chunksPart2 = [];
+        var chunksPart3 = [];
+
+        if (chunks.length > chunkThresholdDouble) {
+            chunksPart1 = chunks.slice(0, chunkThreshold);
+            chunksPart2 = chunks.slice(chunkThreshold, chunkThresholdDouble);
+            chunksPart3 = chunks.slice(chunkThresholdDouble);
+        } else if (chunks.length > chunkThreshold) {
+            chunksPart1 = chunks.slice(0, chunkThreshold);
+            chunksPart2 = chunks.slice(chunkThreshold);
+            chunksPart3 = []; // empty
+        } else {
+            chunksPart1 = chunks;
+            chunksPart2 = [];
+            chunksPart3 = [];
+        }
+
+        return {
+            part1: chunksPart1,
+            part2: chunksPart2,
+            part3: chunksPart3
+        };
+    }
+
+    // ---- Base64 encoding (safe for binary) ----
+    function encodeBase64(byteArray) {
+        var base64String = GlideStringUtil.base64Encode(byteArray);
+        return base64String;
+    }
+
+    // ---- Create PD XML chunk lines ----
+    function buildPDChunkXML(chunksArray) {
+        var xml = '';
+
+        for (var i = 0; i < chunksArray.length; i++) {
+            var b64 = encodeBase64(chunksArray[i]);
+            xml += '<item><LINE>' + b64 + '</LINE></item>';
+        }
+
+        return xml;
+    }
+
+    // === MAIN PROCESS ===
+    var chunkResult = splitIntoByteChunks(binData, 1024);
+
+    var chunksPart1 = chunkResult.part1;
+    var chunksPart2 = chunkResult.part2;
+    var chunksPart3 = chunkResult.part3;
+
+    var fileBodyPart1 = buildPDChunkXML(chunksPart1);
+    var fileBodyPart2 = buildPDChunkXML(chunksPart2);
+    var fileBodyPart3 = buildPDChunkXML(chunksPart3);
+
+    //gs.info("Chunks total: " + (chunksPart1.length + chunksPart2.length));
+    //gs.info("Part1 chunks: " + chunksPart1.length);
+    //gs.info("Part2 chunks: " + chunksPart2.length);
+    //gs.info("----- FILE BODY PART 1 -----");
+    //gs.info(fileBodyPart1);
+    outputs.filebody1 = fileBodyPart1;
+
+    if (chunksPart2.length > 0) {
+        //gs.info("----- FILE BODY PART 2 -----");
+        //gs.info(fileBodyPart2);
+        outputs.filebody2 = fileBodyPart2;
+    }
+    if (chunksPart3.length > 0) {
+        //gs.info("----- FILE BODY PART 2 -----");
+        //gs.info(fileBodyPart2);
+        outputs.filebody3 = fileBodyPart3;
+    }
+    var byteSize = binData.length;
+    var totalChunks = chunksPart1.length + chunksPart2.length + chunksPart3.length;
+    //gs.info(byteSize);
+    //gs.info(totalChunks);
+    //gs.info(fileBody);
+
+
+
+    /////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____
+    /////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____
+    /////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____/////_____//////_____
+
+
+
+
+    function firstPartPayload(size, noChunks, fileName) {
+        var finalChunkNumber = noChunks.toString();
+        var finalSizeNumber = size.toString();
+        while (finalChunkNumber.length < 6) {
+            finalChunkNumber = '0' + finalChunkNumber;
+        }
+
+        while (finalSizeNumber.length < 11) {
+            finalSizeNumber = '0' + finalSizeNumber;
+        }
+
+        // async enabler changes
+        var xmlHeaderServiceName = '';
+        if (asyncSwitchedOn == 'true') {
+            xmlHeaderServiceName = '<n0:ZFI_PD_RFC_SNOW xmlns:n0="urn:sap-com:document:sap:rfc:functions">';
+        } else {
+            xmlHeaderServiceName = '<n0:_-EBY_-PDBO_RFC_DATA_RECEIVE xmlns:n0="urn:sap-com:document:sap:rfc:functions">';
+        }
+        // one row before <ET_MSG_TXT>: <n0:ZFI_PD_RFC_SNOW xmlns:n0="urn:sap-com:document:sap:rfc:functions">
+
+        return `<?xml version="1.0" encoding="utf-8"?>
+<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
+  <soap12:Header>
+    <wsse:Security soap12:mustUnderstand="1" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"/>
+  </soap12:Header>
+  <soap12:Body>
+${xmlHeaderServiceName}
+ <ET_MSG_TXT>
+  <item>
+   <MSG_GRP></MSG_GRP>
+   <MSG_TYPE></MSG_TYPE>
+   <MSG_ID></MSG_ID>
+   <MSG_NO></MSG_NO>
+   <MSG_V1></MSG_V1>
+   <MSG_V2></MSG_V2>
+   <MSG_V3></MSG_V3>
+   <MSG_V4></MSG_V4>
+   <GROUP_NO></GROUP_NO>
+   <ACTION></ACTION>
+   <EVENT></EVENT>
+   <PD_FIELD></PD_FIELD>
+   <PD_GUID></PD_GUID>
+   <MSG_TXT></MSG_TXT>
+  </item>
+  <item>
+   <MSG_GRP></MSG_GRP>
+   <MSG_TYPE></MSG_TYPE>
+   <MSG_ID></MSG_ID>
+   <MSG_NO></MSG_NO>
+   <MSG_V1></MSG_V1>
+   <MSG_V2></MSG_V2>
+   <MSG_V3></MSG_V3>
+   <MSG_V4></MSG_V4>
+   <GROUP_NO></GROUP_NO>
+   <ACTION></ACTION>
+   <EVENT></EVENT>
+   <PD_FIELD></PD_FIELD>
+   <PD_GUID></PD_GUID>
+   <MSG_TXT></MSG_TXT>
+  </item>
+ </ET_MSG_TXT>
+ <IC_ENV>02</IC_ENV>
+ <IC_MAPID>PICI</IC_MAPID>
+ <IC_OBJ>IV</IC_OBJ>
+ <IT_ARC_HDR>
+  <item>
+   <SAP_OBJECT>/COCKPIT/B</SAP_OBJECT>
+   <OBJECT_ID></OBJECT_ID>
+   <ARC_DOC_ID></ARC_DOC_ID>
+   <ARCHIV_ID>I1</ARCHIV_ID>
+   <AR_OBJECT></AR_OBJECT>
+   <AR_DATE></AR_DATE>
+   <AR_TIME></AR_TIME>
+   <BINLENGTH>${finalSizeNumber}</BINLENGTH>
+   <DOCUMENT_TYPE>PDF</DOCUMENT_TYPE>
+   <URI></URI>
+   <MIMETYPE></MIMETYPE>
+   <COMPID></COMPID>
+   <OBJECTTEXT></OBJECTTEXT>
+   <FIRSTLINE>000001</FIRSTLINE>
+   <LASTLINE>${finalChunkNumber}</LASTLINE>
+   <FILENAME>${fileName}</FILENAME>
+   <CREATOR>RFC_LEXMARK</CREATOR>
+   <DESCR></DESCR>
+   <SHOW>0</SHOW>
+   <STATE>0</STATE>
+  </item>
+ </IT_ARC_HDR>
+ <IT_ARC_OBJ>`;
+
+    }
+
+    //
+    //// function for trimming values to fit their max length expected by the PD
+    //
+    function trimIfTooLong(pdFieldName, value) {
+        // Get max lengths JSON from sys_property
+        var limitsJson = gs.getProperty('x_742494_cch_edge.CCH-APO-PD-FieldLengthLimits');
+        if (!limitsJson) return value;
+
+        var limits;
+        try {
+            limits = JSON.parse(limitsJson);
+        } catch (e) {
+            gs.warn('Invalid JSON in property x_742494_cch_edge.CCH-APO-PD-FieldLengthLimits');
+            return value;
+        }
+
+        // If PD field not in limits, return original
+        if (!limits[pdFieldName]) return value;
+
+        var maxLength = parseInt(limits[pdFieldName], 10);
+        if (typeof value === 'string' && value.length > maxLength) {
+            gs.warn('Trimming PD field ' + pdFieldName + ' from ' + value.length + ' to ' + maxLength + ' characters.');
+            return value.substring(0, maxLength);
+        }
+
+        return value;
+    }
+
+
+    function fieldMapping(invoiceSysId) {
+        var fieldsProperty = JSON.parse(gs.getProperty('x_742494_cch_edge.CCH-APO-Field Mapping for PD integration'));
+
+        var payload = "<IT_DATA>";
+        var headPayload = '';
+        var linePayload = '';
+        var bankPayload = '';
+        var taxPayload = '';
+        var invalidReasonPayload = '';
+        var accountPayload = '';
+
+        var invoiceFields = fieldsProperty.Head.Fields;
+        var invoiceMappingJson = fieldsProperty.Head.Mapping;
+        var invoiceLineFields = fieldsProperty.Line.Fields;
+        var invoiceLineMappingJson = fieldsProperty.Line.Mapping;
+        var bankFields = fieldsProperty.Bank.Fields;
+        var bankMapping = fieldsProperty.Bank.Mapping;
+        var taxFields = fieldsProperty.Tax.Fields;
+        var taxMapping = fieldsProperty.Tax.Mapping;
+        var accountFields = fieldsProperty.Account.Fields;
+        var accountMapping = fieldsProperty.Account.Mapping
+        var invoiceGr = new GlideRecord('sn_shop_invoice');
+        invoiceGr.get(invoiceSysId);
+
+
+        invoiceFields.forEach(function(field) {
+
+            // Skip Swiss specific fields for non Swiss Invoices
+            if ((invoiceGr.u_country != "CH") && (field == "u_additional_info_qr" || field == "u_qr_amount" || field == "u_qr_currency" || field == "u_qr_iban" || field == "u_qr_reference")) {
+                return;
+            }
+
+            // don´t process "u_vendor_vat_registration_number": "STCEG", as it must be same as ZEIC_CCH_BUKRS_STCEG, which is processed below
+            if (field == "u_vendor_vat_registration_number") {
+                return;
+            }
+
+            var value = invoiceGr[field + ''] + '';
+            if (value) {
+                if (field == "invoice_date" || field == "u_tax_reporting_date" || field == "due_date" || field == 'u_scan_date' || field == 'erp_posting_date') {
+                    value = value.replace(/[^a-zA-Z0-9 ]/g, ''); // removing special characters
+                }
+                if (field.includes(';')) {
+                    var number = value.split(';');
+                    value = number[1];
+                }
+
+                // added for currency fields in string form
+                if (value.includes(';')) {
+                    var plainNumber = value.split(';')[1];
+                    value = plainNumber;
+                }
+
+                ////////////////////////////////////////////////////////////////////////////
+                ////////////   u_purchase_order_number LOGIC 20260206 //////////////////////
+                ////////////////////////////////////////////////////////////////////////////
+
+                // HEADER PO logic: blank header PO if any line has a different non-blank PO (only for type="invoice")
+                if (field == 'u_purchase_order_number') {
+
+                    if (invoiceGr.type == 'non_po_invoice') { // non po value blank
+                        value = '';
+                    } else {
+
+                        if (invoiceGr.getValue('type') == 'invoice') {
+
+                            var headerPO = invoiceGr.getValue('u_purchase_order_number') || '';
+
+                            if (!headerPO) {
+                                value = '';
+                            } else {
+
+                                var mismatchFound = false;
+
+                                var lineGr = new GlideRecord('sn_shop_invoice_line');
+                                lineGr.addQuery('invoice', invoiceSysId);
+                                lineGr.orderBy('u_line_number');
+                                lineGr.query();
+
+                                while (lineGr.next()) {
+                                    var linePO = lineGr.getValue('u_purchase_order') || '';
+
+                                    // skip blank line POs
+                                    if (!linePO) {
+                                        continue;
+                                    }
+
+                                    // exact mismatch
+                                    if (linePO !== headerPO) {
+                                        mismatchFound = true;
+                                        break;
+                                    }
+                                }
+
+                                if (mismatchFound) {
+                                    value = '';
+                                } else {
+                                    value = headerPO; // send as-is
+                                }
+                            }
+                        }
+
+                    }
+                }
+
+
+
+                // Do not send Delivery Note (u_delivery_note, LFSNR) for non-po invoices
+                if (invoiceGr.type == 'non_po_invoice' && field == 'u_delivery_note') {
+                    value = '';
+                }
+
+                if (invoiceGr.u_document_type == 'Credit Note' && value.startsWith('-') && !isNaN(Number(value))) {
+                    value = -1 * Number(value);
+                    value = value.toString();
+                }
+                var invalidReasons = invoiceGr.u_invalid_reason.split(',');
+                if (invalidReasons.includes('1') && field == 'u_vendor_id' && value == '') {
+                    value = '9999999999';
+                }
+
+                if (field == "u_final_currency") {
+                    value = invoiceGr.u_final_currency.getDisplayValue();
+                }
+
+                if (field == "u_qr_amount") {
+                    value = invoiceGr.u_qr_amount.amount || 0;
+                    value = value.toString();
+                }
+
+                // u_invoice_freight_amount + u_invoice_miscellaneous_charge
+                if (field == "u_invoice_freight_amount") {
+                    var freight = invoiceGr.u_invoice_freight_amount.amount || 0;
+                    var misc = invoiceGr.u_invoice_miscellaneous_charge.amount || 0;
+                    value = freight + misc;
+                }
+
+                // remove problematic chars
+                if (value.includes('&')) {
+                    var newValue = value.replace('&', ' ');
+                    value = newValue;
+                }
+
+                // DSCT_AMOUNT, GROSS_AMOUNT, ZEIC_CCH_WHT_AMT, DEL_COSTS, NET_AMOUNT, ZEIC_CCH_WHT_AMT
+                if (field == "u_invoice_discount_amount" || field == "invoice_amount" || field == "tax_amount" || field == "subtotal" || field == "u_withholding_tax_amount") {
+                    //value = invoiceGr.u_invoice_discount_amount.amount;
+                    value = invoiceGr[field + ''].amount + '';
+                }
+
+
+                var trimmed = trimIfTooLong(invoiceMappingJson[field], value + '');
+                value = trimmed;
+                value = value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+            }
+            headPayload += `<item>
+  <NODE>I_STR_HEADER</NODE>
+  <SUBNODE>000000</SUBNODE>
+  <PARENTNODE></PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>${invoiceMappingJson[field]}</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${!value ? '' : value}</EXTVALUE>
+</item>`;
+
+            // logic for resolving duplicated REF_DOC_NO mapped to supplier_invoice_number field, supplier should be mapped to the REF_DOC_NO and ZEIC_CCH_INV_REF_L
+            // "supplier_invoice_number": "ZEIC_CCH_INV_REF_L",
+            if (field == "supplier_invoice_number" && value) {
+                var trimmedZeic = trimIfTooLong("ZEIC_CCH_INV_REF_L", value + '');
+                value = trimmedZeic;
+                value = value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                headPayload += `<item>
+  <NODE>I_STR_HEADER</NODE>
+  <SUBNODE>000000</SUBNODE>
+  <PARENTNODE></PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>ZEIC_CCH_INV_REF_L</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${!value ? '' : value}</EXTVALUE>
+</item>`;
+            }
+
+        });
+
+
+
+        //
+        ////
+        ////// additional chunks in header node
+        ////
+        //
+
+        // put here the additional chunk for DOC_TYPE
+        headPayload += `<item>
+  <NODE>I_STR_HEADER</NODE>
+  <SUBNODE>000000</SUBNODE>
+  <PARENTNODE></PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>DOC_TYPE</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${inputs.doc_type || ''}</EXTVALUE>
+</item>`;
+
+        // put here the computed value for INVOICE_IND. If the IF the field u_document_type is Invoice, then send "X". otherwise blank
+        var invoiceIndValue = "";
+        if (invoiceGr.u_document_type == "Invoice") {
+            invoiceIndValue = "X";
+        }
+        headPayload += `<item>
+  <NODE>I_STR_HEADER</NODE>
+  <SUBNODE>000000</SUBNODE>
+  <PARENTNODE></PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>INVOICE_IND</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${invoiceIndValue}</EXTVALUE>
+</item>`;
+
+        // STCEG
+
+        var vendorId = invoiceGr.getValue('u_vendor_id') || '';
+        var invoiceVat = invoiceGr.getValue('u_vendor_vat_registration_number') || '';
+        var trimmedVat = (invoiceVat || '').replace(/[^0-9]/g, '');
+
+        // === RESULT ===
+        var finalVat = '';
+
+        // === MASTER exists? (sn_fin_org_tax_detail where organization.erp_company_code = vendorId) ===
+        var orgTaxDetailGR = new GlideRecord('sn_fin_org_tax_detail');
+        orgTaxDetailGR.addQuery('organization.erp_company_code', vendorId);
+        orgTaxDetailGR.setLimit(1);
+        orgTaxDetailGR.query();
+
+        if (orgTaxDetailGR.hasNext()) {
+
+            // === MASTER match: vendorId + (tax_id = invoiceVat OR trimmedVat) ===
+            var orgDetailGR = new GlideRecord('sn_fin_org_tax_detail');
+            orgDetailGR.addQuery('organization.erp_company_code', vendorId);
+
+            if (invoiceVat) {
+                var qc = orgDetailGR.addQuery('tax_id', invoiceVat);
+                if (trimmedVat) {
+                    qc.addOrCondition('tax_id', 'CONTAINS', trimmedVat);
+                }
+            } else {
+                orgDetailGR.addQuery('tax_id', ''); // keep query valid, yields 0
+            }
+
+            orgDetailGR.query();
+
+            if (orgDetailGR.getRowCount() == 1) {
+                orgDetailGR.next();
+                finalVat = orgDetailGR.getValue('tax_id') || '';
+            }
+
+            // === No match in MASTER -> Supplier fallback by VAT (original + trimmed) ===
+            if (orgDetailGR.getRowCount() == 0) {
+
+                var base = 'erp_company_codeSTARTSWITH' + vendorId + '^u_central_deletion_flag=false^';
+                var encoded = '';
+
+                if (invoiceVat) {
+                    encoded =
+                        base +
+                        'u_tax_number_1CONTAINS' + invoiceVat +
+                        '^ORu_tax_number_2CONTAINS' + invoiceVat +
+                        '^ORu_tax_number_3CONTAINS' + invoiceVat +
+                        '^ORu_tax_number_4CONTAINS' + invoiceVat +
+                        '^ORu_tax_number_5CONTAINS' + invoiceVat +
+                        '^ORu_tax_number_6CONTAINS' + invoiceVat +
+                        '^ORu_vat_numberCONTAINS' + invoiceVat;
+                }
+
+                if (trimmedVat) {
+                    encoded = encoded ?
+                        (encoded + '^NQ' + base +
+                            'u_tax_number_1CONTAINS' + trimmedVat +
+                            '^ORu_tax_number_2CONTAINS' + trimmedVat +
+                            '^ORu_tax_number_3CONTAINS' + trimmedVat +
+                            '^ORu_tax_number_4CONTAINS' + trimmedVat +
+                            '^ORu_tax_number_5CONTAINS' + trimmedVat +
+                            '^ORu_tax_number_6CONTAINS' + trimmedVat +
+                            '^ORu_vat_numberCONTAINS' + trimmedVat) :
+                        (base +
+                            'u_tax_number_1CONTAINS' + trimmedVat +
+                            '^ORu_tax_number_2CONTAINS' + trimmedVat +
+                            '^ORu_tax_number_3CONTAINS' + trimmedVat +
+                            '^ORu_tax_number_4CONTAINS' + trimmedVat +
+                            '^ORu_tax_number_5CONTAINS' + trimmedVat +
+                            '^ORu_tax_number_6CONTAINS' + trimmedVat +
+                            '^ORu_vat_numberCONTAINS' + trimmedVat);
+                }
+
+                if (encoded) {
+                    var supplierFallbackGR = new GlideRecord('sn_fin_supplier');
+                    supplierFallbackGR.addEncodedQuery(encoded);
+                    supplierFallbackGR.query();
+
+                    if (supplierFallbackGR.getRowCount() == 1) {
+                        supplierFallbackGR.next();
+                        finalVat = supplierFallbackGR.getValue('u_vat_number') || '';
+                    } else {
+                        finalVat = '';
+                    }
+                } else {
+                    finalVat = '';
+                }
+            }
+
+        } else {
+
+            // === NO MASTER -> Supplier by vendorId + deletion flag (assign VAT even if blank) ===
+            var supplierGR = new GlideRecord('sn_fin_supplier');
+            supplierGR.addQuery('erp_company_code', 'STARTSWITH', vendorId);
+            supplierGR.addQuery('u_central_deletion_flag', false);
+            supplierGR.query();
+
+            if (supplierGR.getRowCount() >= 1) {
+                supplierGR.next();
+                finalVat = supplierGR.getValue('u_vat_number') || '';
+            } else {
+                finalVat = '';
+            }
+        }
+
+        // Add STCEG to headPayload
+        headPayload += `<item>
+  <NODE>I_STR_HEADER</NODE>
+  <SUBNODE>000000</SUBNODE>
+  <PARENTNODE></PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>STCEG</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${finalVat}</EXTVALUE>
+</item>`;
+
+
+        // ZEIC_CCH_BUKRS_STCEG: send VAT Registration No. from Legal Entity, if empty then Tax 1 or Tax 2
+        // Resolve value for ZEIC_CCH_BUKRS_STCEG
+        var bukrsStceg = '';
+        var le1 = '';
+        var le2 = '';
+        var le3 = '';
+
+        // 1. Try dot-walk via legal_entity reference
+        if (invoiceGr.legal_entity) {
+            le1 = invoiceGr.legal_entity.u_vat_registration_no + '';
+            le2 = invoiceGr.legal_entity.u_tax_1 + '';
+            le3 = invoiceGr.legal_entity.u_tax_2 + '';
+
+            if (le1.trim()) {
+                bukrsStceg = le1.trim();
+            } else if (le2.trim()) {
+                bukrsStceg = le2.trim();
+            } else if (le3.trim()) {
+                bukrsStceg = le3.trim();
+            }
+        }
+
+        // 2. If dot-walk failed, query sn_fin_legal_entity by erp_company_code
+        if (!bukrsStceg && invoiceGr.u_company_code) {
+            var leGr = new GlideRecord('sn_fin_legal_entity');
+            leGr.addQuery('erp_company_code', invoiceGr.u_company_code);
+            leGr.query();
+            if (leGr.next()) {
+                le1 = leGr.u_vat_registration_no + '';
+                le2 = leGr.u_tax_1 + '';
+                le3 = leGr.u_tax_2 + '';
+
+                if (le1.trim()) {
+                    bukrsStceg = le1.trim();
+                } else if (le2.trim()) {
+                    bukrsStceg = le2.trim();
+                } else if (le3.trim()) {
+                    bukrsStceg = le3.trim();
+                }
+            }
+        }
+
+        // 3. Final fallback
+        if (bukrsStceg) {
+            var trimmed = trimIfTooLong("ZEIC_CCH_BUKRS_STCEG", bukrsStceg + '');
+            bukrsStceg = trimmed;
+            bukrsStceg = bukrsStceg.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+            if (invoiceGr.u_company_code == "441" || invoiceGr.u_company_code == "443" || invoiceGr.u_company_code == "0441" || invoiceGr.u_company_code == "0443") {
+                bukrsStceg = '';
+            }
+        }
+
+        // Add ZEIC_CCH_BUKRS_STCEG to headPayload
+        headPayload += `<item>
+  <NODE>I_STR_HEADER</NODE>
+  <SUBNODE>000000</SUBNODE>
+  <PARENTNODE></PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>ZEIC_CCH_BUKRS_STCEG</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${bukrsStceg}</EXTVALUE>
+</item>`;
+
+
+
+
+        //
+        ////
+        //////
+        ////
+        //
+        // Bank details 
+        var counter = 0;
+        var bankGr = new GlideRecord('sn_shop_bank_detail');
+        bankGr.addQuery('u_invoice', invoiceSysId);
+        bankGr.setLimit(4);
+        bankGr.orderBy("u_number");
+        bankGr.query();
+        while (bankGr.next()) {
+            counter++;
+            bankFields.forEach(function(field) {
+                var value = bankGr[field + ''] + '';
+
+                if (value) {
+                    //send blank if bank account has more than 18 chars
+                    if (field == "u_bank_account") {
+                        var stringValue = bankGr.u_bank_account + '';
+                        if (stringValue.length > 18) {
+                            value = "";
+                        }
+                    }
+
+                    // escape new line character
+                    var oneLineValue = value.replace(/[\r\n]+/g, ' ');
+                    value = oneLineValue;
+
+                    var trimmed = trimIfTooLong(bankMapping[field], value);
+                    value = trimmed;
+                    value = value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+                }
+                bankPayload += `
+<item>
+  <NODE>I_STR_HEADER</NODE>
+  <SUBNODE>000000</SUBNODE>
+  <PARENTNODE></PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>${bankMapping[field] + counter}</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${!value ? '' : value}</EXTVALUE>
+</item>`;
+            });
+
+        }
+
+        // Line level
+        var invoiceLineGr = new GlideRecord("sn_shop_invoice_line");
+        invoiceLineGr.addQuery('invoice', invoiceSysId);
+
+        // === GL ACCOUNT and CostCenter Logic ===
+        // NO GL Acc    +   NO CC   =   DONT SEND
+        // NO GL Acc    +    CC     =   DONT SEND
+        // GL Acc       +   NO CC   =     SEND
+        // GL Acc       +    CC     =     SEND 
+
+        if (invoiceGr.type == 'non_po_invoice') {
+            invoiceLineGr.addEncodedQuery('u_gl_accountISNOTEMPTY');
+        }
+
+        invoiceLineGr.orderBy("u_line_number");
+        invoiceLineGr.query();
+        while (invoiceLineGr.next()) {
+            var lineNumber = invoiceLineGr.u_line_number.toString();
+            while (lineNumber.length < 6) {
+                lineNumber = '0' + lineNumber;
+            }
+
+            invoiceLineFields.forEach(function(field) {
+                var value = invoiceLineGr[field] + '';
+
+                if (value) {
+                    if (value.includes(';')) {
+                        var number = value.split(';')[1];
+                        value = number;
+                    }
+                    // remove problematic chars
+                    if (value.includes('&')) {
+                        var newValue = value.replace('&', ' ');
+                        value = newValue;
+                    }
+
+                    // TAX_AMOUNT, ITEM_AMOUNT
+                    if (field == "tax_amount" || field == "u_net_amount_without_tax") {
+                        //value = invoiceLineGr.tax_amount.amount;
+                        value = invoiceLineGr[field + ''].amount + '';
+                    }
+
+                    if (invoiceLineGr.invoice.u_document_type == 'Credit Note' && value.startsWith('-') && !isNaN(Number(value))) {
+                        value = -1 * Number(value);
+                        value = value.toString();
+                    }
+
+                    //ITEM_TEXT prep for max lenght 50 characters
+                    if (field == 'line_description' && value) {
+                        value = value.slice(0, 50);
+                    }
+
+                    if (field == 'u_purchase_order' && value) { //u_purchase_order aka PO_number prepare logic
+                        if (invoiceGr.type == 'non_po_invoice') {
+                            value = '';
+                        } else {
+                            var poParts = value.split(',');
+                            var firstPo = poParts[0].trim();
+                            value = firstPo.substring(0, 10);
+                        }
+                    }
+                    // escape new line character
+                    var oneLineValue = value.replace(/[\r\n]+/g, ' ');
+                    value = oneLineValue;
+
+                    var trimmed = trimIfTooLong(invoiceLineMappingJson[field], value + '');
+                    value = trimmed;
+                    value = value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+                }
+
+                if (!(invoiceGr.type == 'non_po_invoice' && field == "u_net_amount_without_tax")) {
+                    linePayload += `
+<item>
+  <NODE>I_TAB_ITEM</NODE>
+  <SUBNODE>${lineNumber}</SUBNODE>
+  <PARENTNODE>I_STR_HEADER</PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>${invoiceLineMappingJson[field]}</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${!value ? '' : value}</EXTVALUE>
+</item>`;
+                } else {
+                    linePayload += `
+<item>
+  <NODE>I_TAB_ACCOUNT</NODE>
+  <SUBNODE>${lineNumber}</SUBNODE>
+  <PARENTNODE>I_STR_HEADER</PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>NET_AMOUNT</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${!value ? '' : value}</EXTVALUE>
+</item>`;
+                }
+
+
+            });
+
+            // --- GL Account data for FI docs (I_TAB_ACCOUNT) ---
+            // New section as a part of INVL, subnode increments with a number of INVL
+            accountFields.forEach(function(field) {
+                var accValue = invoiceLineGr[field + ''] + '';
+
+                if (accValue) {
+                    // escape new line character
+                    var oneLineValue = accValue.replace(/[\r\n]+/g, ' ');
+                    accValue = oneLineValue;
+
+                    // Trimming to max lenght 10 chars
+                    var trimmed = trimIfTooLong(accountMapping[field], accValue + '');
+                    accValue = trimmed;
+                    accValue = accValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); //removing problematic chars
+                }
+
+                accountPayload += `
+<item>
+  <NODE>I_TAB_ACCOUNT</NODE>
+  <SUBNODE>${lineNumber}</SUBNODE>
+  <PARENTNODE>I_STR_HEADER</PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>${accountMapping[field]}</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${!accValue ? '' : accValue}</EXTVALUE>
+</item>`;
+            });
+
+
+        }
+
+
+        // Tax level
+        taxFields.forEach(function(field) {
+            var taxValue = invoiceGr[field] + '';
+
+            if (taxValue) {
+                if (taxValue.includes(';')) {
+                    var newValue = taxValue.split(';');
+                    taxValue = newValue[1];
+                }
+
+                // TAX_AMOUNT
+                if (field == "tax_amount") {
+                    taxValue = invoiceGr.tax_amount.amount;
+                }
+
+                // escape new line character
+                var oneLineValue = taxValue.replace(/[\r\n]+/g, ' ');
+                taxValue = oneLineValue;
+
+                var trimmed = trimIfTooLong(taxMapping[field], taxValue + '');
+                taxValue = trimmed;
+                taxValue = taxValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            }
+
+            taxPayload += `
+<item>
+  <NODE>I_TAB_TAX</NODE>
+  <SUBNODE>000000</SUBNODE>
+  <PARENTNODE>I_STR_HEADER</PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>${taxMapping[field]}</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${!taxValue ? '' : taxValue}</EXTVALUE>
+</item>`;
+        });
+
+
+        // IT_PROCESSLOG level
+        var invalidReasonValue = '';
+
+        var rawProp = gs.getProperty('x_742494_cch_edge.CCH-APO-Invalid_Reason', '{}');
+        var map = JSON.parse(rawProp);
+
+        var raw = (invoiceGr.u_invalid_reason || '').trim();
+        if (raw) {
+            var best = null; // {display, prio}
+
+            raw.split(',').forEach(function(idStr) {
+                var id = (idStr + '').trim();
+                var def = map[id];
+                if (!def) return;
+
+                var p = (def.priority + '').trim();
+                if (!p) return; // blank priority => ignore entirely
+
+                var prioNum = parseInt(p, 10);
+                if (isNaN(prioNum)) return;
+
+                // lower number = higher priority
+                if (!best || prioNum < best.prio) {
+                    best = {
+                        display: (def.display || '') + '',
+                        prio: prioNum
+                    };
+                }
+            });
+
+            if (best) {
+                invalidReasonValue = best.display;
+            }
+        }
+
+
+
+        invalidReasonValue = invalidReasonValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        invalidReasonPayload += `
+<item>
+  <NODE>IT_PROCESSLOG</NODE>
+  <SUBNODE>000001</SUBNODE>
+  <PARENTNODE>I_STR_HEADER</PARENTNODE>
+  <PARENTSUBNODE>000000</PARENTSUBNODE>
+  <EXTFIELD>MESSAGE_V1</EXTFIELD>
+  <EXTENT>001</EXTENT>
+  <EXTVALUE>${invalidReasonValue}</EXTVALUE>
+</item>`;
+
+
+        // async enabler changes
+        if (asyncSwitchedOn == 'true') {
+            payload += headPayload + bankPayload + linePayload + accountPayload + taxPayload + invalidReasonPayload + ` </IT_DATA>
+            </n0:ZFI_PD_RFC_SNOW>
+            </soap12:Body>
+            </soap12:Envelope>`;
+        } else {
+            payload += headPayload + bankPayload + linePayload + accountPayload + taxPayload + invalidReasonPayload + ` </IT_DATA>
+            </n0:_-EBY_-PDBO_RFC_DATA_RECEIVE>
+            </soap12:Body>
+            </soap12:Envelope>`;
+        }
+        // invoice line mapping and Bank mapping logic to be created
+
+        return payload;
+    }
+
+    //outputs.payload = firstPartPayload(byteSize, totalChunks, fileName) + fileBody + `</IT_ARC_OBJ>` + fieldMapping(invoiceSysId);
+    outputs.payload = firstPartPayload(byteSize, totalChunks, fileName);
+    // outputs for fileBody1 and fileBody2 in the === MAIN PROCESS ===
+    outputs.payload_footer = `</IT_ARC_OBJ>` + fieldMapping(invoiceSysId);
+
+
+    // Last update 2026_02_06 - purchase order number story 865744
+        return outputs;
+    },
+
+    type: 'CCHPayloadPrepScriptInclude'
+};
